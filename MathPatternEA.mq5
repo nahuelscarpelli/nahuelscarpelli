@@ -9,8 +9,8 @@
 // Max exposure ~2.2x base vs 10x+ in v1/v2.
 //+------------------------------------------------------------------+
 #property copyright "Nahuel Scarpelli"
-#property version   "3.00"
-#property description "v3: Z-Score Crossback + Averaging Estadistico"
+#property version   "3.10"
+#property description "v3.1: Fix Mean Reversion TP cutting winners too short"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -34,9 +34,10 @@ input int             InpMaxLayers     = 3;              // Max niveles averagin
 input double          InpZoneATRMult   = 2.0;            // Zona = ATR x esto
 input double          InpLotReduction  = 0.7;            // Cada capa = anterior x esto
 input double          InpTargetProfit  = 5.0;            // Target USD por ciclo
+input double          InpMinProfitForSMA = 2.0;          // Min profit USD para cerrar en SMA
 
 input group "══════ GESTION DE RIESGO ══════"
-input double          InpHardSL_ATR    = 4.0;            // Hard SL = ATR x esto
+input double          InpHardSL_ATR    = 3.0;            // Hard SL = ATR x esto (v3=4.0)
 input double          InpMaxDrawdownPct = 20.0;          // Drawdown maximo %
 input double          InpDailyLossMax   = 30.0;          // Perdida diaria max USD
 input int             InpMaxBarsInTrade = 200;           // Time stop (barras)
@@ -83,7 +84,7 @@ int OnInit()
    double pl = 0;
    if(CountMyPositions(pl) > 0) { g_cycleActive = true; RecoverCycleState(); }
 
-   Print("=== MathPatternEA v3.0 - Averaging Estadistico ===");
+   Print("=== MathPatternEA v3.1 - Averaging Estadistico ===");
    Print(StringFormat("  Z±%.1f | Layers:%d | LotRedux:%.0f%% | SL:%.1fATR | Target:$%.1f",
          InpZScoreEntry, InpMaxLayers, InpLotReduction*100, InpHardSL_ATR, InpTargetProfit));
    return INIT_SUCCEEDED;
@@ -152,8 +153,8 @@ void OnTick()
       { CloseAll(StringFormat("TARGET +%.2f L%d %db", netPL, g_layerCount, g_barsInTrade));
         UpdateChart(netPL); return; }
 
-      // Mean reversion TP: price crossed SMA
-      if(IsMeanReversionDone() && netPL > 0)
+      // Mean reversion TP: price crossed SMA (only if decent profit)
+      if(IsMeanReversionDone() && netPL >= InpMinProfitForSMA)
       { CloseAll(StringFormat("MEAN REV +%.2f", netPL)); UpdateChart(netPL); return; }
 
       // Averaging layer
@@ -399,7 +400,7 @@ void UpdateChart(double netPL)
    string cd = (g_cooldownLeft > 0) ? StringFormat(" CD:%d", g_cooldownLeft) : "";
 
    Comment(StringFormat(
-      "\n  === MATH PATTERN EA v3.0 ===\n"
+      "\n  === MATH PATTERN EA v3.1 ===\n"
       "  %s%s\n"
       "  Z:%.2f (±%.1f) Prev:%.2f\n"
       "  AvgEntry:%.5f Lots:%.3f\n"
