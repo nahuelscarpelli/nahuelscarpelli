@@ -1,16 +1,14 @@
 //+------------------------------------------------------------------+
 //|                                              MathPatternEA.mq5   |
 //|                          Copyright 2026, Nahuel Scarpelli        |
-//|              v3: Z-Score Crossback + Averaging Estadistico       |
+//|              v4: Optimized params + Dynamic lot sizing            |
 //+------------------------------------------------------------------+
-// v3: Same-direction averaging with DECREASING lots.
-// v1/v2 (zone recovery) blew accounts: opposite-direction exponential lots.
-// v3: all adds are SAME direction, lots shrink each layer.
-// Max exposure ~2.2x base vs 10x+ in v1/v2.
+// v4: Best params from optimizer + dynamic position sizing.
+// Lot scales with balance = compounding. Target scales with lot.
 //+------------------------------------------------------------------+
 #property copyright "Nahuel Scarpelli"
-#property version   "3.20"
-#property description "v3.2: Tighter SL + higher min profit for SMA close"
+#property version   "4.00"
+#property description "v4: Optimized + Dynamic Lot Sizing"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -19,7 +17,7 @@
 input group "══════ MOTOR ESTADISTICO ══════"
 input ENUM_TIMEFRAMES InpTimeframe     = PERIOD_M15;
 input int             InpZScorePeriod  = 100;            // Periodo Z-Score
-input double          InpZScoreEntry   = 2.5;            // Umbral Z-Score
+input double          InpZScoreEntry   = 3.0;            // Umbral Z-Score (opt)
 input int             InpATRPeriod     = 14;             // Periodo ATR
 
 input group "══════ FILTROS ══════"
@@ -28,18 +26,17 @@ input int             InpSessionEnd    = 20;             // Hora fin sesion
 input double          InpMaxSMASlope   = 0.0004;         // Pendiente max SMA
 input int             InpCooldownBars  = 10;             // Cooldown tras perdida
 
-input group "══════ AVERAGING ══════"
-input double          InpBaseLot       = 0.01;           // Lote base
-input int             InpMaxLayers     = 3;              // Max niveles averaging
-input double          InpZoneATRMult   = 2.0;            // Zona = ATR x esto
-input double          InpLotReduction  = 0.7;            // Cada capa = anterior x esto
-input double          InpTargetProfit  = 5.0;            // Target USD por ciclo
-input double          InpMinProfitForSMA = 3.0;          // Min profit USD para cerrar en SMA (v3.1=2.0)
+input group "══════ POSITION SIZING ══════"
+input double          InpRiskPercent   = 2.0;            // % del balance por ciclo
+input int             InpMaxLayers     = 3;              // Max niveles averaging (opt)
+input double          InpZoneATRMult   = 1.5;            // Zona = ATR x esto (opt)
+input double          InpLotReduction  = 0.5;            // Cada capa = anterior x esto (opt)
+input double          InpMinProfitForSMA = 1.5;          // Min profit USD para cerrar en SMA (opt)
 
 input group "══════ GESTION DE RIESGO ══════"
-input double          InpHardSL_ATR    = 2.5;            // Hard SL = ATR x esto (v3.1=3.0)
-input double          InpMaxDrawdownPct = 20.0;          // Drawdown maximo %
-input double          InpDailyLossMax   = 30.0;          // Perdida diaria max USD
+input double          InpHardSL_ATR    = 4.0;            // Hard SL = ATR x esto (opt)
+input double          InpMaxDrawdownPct = 25.0;          // Drawdown maximo %
+input double          InpDailyLossMax   = 50.0;          // Perdida diaria max USD
 input int             InpMaxBarsInTrade = 200;           // Time stop (barras)
 input int             InpMagicNumber    = 777777;
 
@@ -61,6 +58,8 @@ int    g_dailyDate      = 0;
 datetime g_lastBarTime  = 0;
 int    g_cooldownLeft   = 0;
 double g_prevZScore     = 0;
+double g_cycleBaseLot   = 0;       // Dynamic lot for current cycle
+double g_dynamicTarget  = 5.0;     // Dynamic target for current cycle
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -84,9 +83,9 @@ int OnInit()
    double pl = 0;
    if(CountMyPositions(pl) > 0) { g_cycleActive = true; RecoverCycleState(); }
 
-   Print("=== MathPatternEA v3.1 - Averaging Estadistico ===");
-   Print(StringFormat("  Z±%.1f | Layers:%d | LotRedux:%.0f%% | SL:%.1fATR | Target:$%.1f",
-         InpZScoreEntry, InpMaxLayers, InpLotReduction*100, InpHardSL_ATR, InpTargetProfit));
+   Print("=== MathPatternEA v4.0 - Dynamic Lot + Optimized ===");
+   Print(StringFormat("  Z±%.1f | Risk:%.1f%% | Layers:%d | LotRedux:%.0f%% | SL:%.1fATR",
+         InpZScoreEntry, InpRiskPercent, InpMaxLayers, InpLotReduction*100, InpHardSL_ATR));
    return INIT_SUCCEEDED;
 }
 
@@ -148,13 +147,14 @@ void OnTick()
          UpdateChart(netPL); return;
       }
 
-      // Target profit
-      if(netPL >= InpTargetProfit)
+      // Target profit (dynamic, scales with lot)
+      if(netPL >= g_dynamicTarget)
       { CloseAll(StringFormat("TARGET +%.2f L%d %db", netPL, g_layerCount, g_barsInTrade));
         UpdateChart(netPL); return; }
 
-      // Mean reversion TP: price crossed SMA (only if decent profit)
-      if(IsMeanReversionDone() && netPL >= InpMinProfitForSMA)
+      // Mean reversion TP: price crossed SMA (min profit scales with lot too)
+      double dynMinSMA = InpMinProfitForSMA * (g_cycleBaseLot / 0.01);
+      if(IsMeanReversionDone() && netPL >= dynMinSMA)
       { CloseAll(StringFormat("MEAN REV +%.2f", netPL)); UpdateChart(netPL); return; }
 
       // Averaging layer
@@ -232,22 +232,58 @@ double GetSMA()
 //+------------------------------------------------------------------+
 //| AVERAGING ENGINE                                                  |
 //+------------------------------------------------------------------+
+// Dynamic lot: risk% of balance / (SL distance in money per lot)
+double CalcDynamicLot()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * InpRiskPercent / 100.0;
+   double atr = GetATR();
+   if(atr <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double slDistance = atr * InpHardSL_ATR;
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0 || tickValue <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double slMoneyPerLot = (slDistance / tickSize) * tickValue;
+   if(slMoneyPerLot <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double lot = riskMoney / slMoneyPerLot;
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   lot = MathFloor(lot / step) * step;
+   return MathMax(MathMin(lot, maxL), minL);
+}
+
+// Dynamic target: scales proportionally with lot size
+double CalcDynamicTarget(double baseLot)
+{
+   double refLot = 0.01;
+   return 5.0 * (baseLot / refLot);
+}
+
 void OpenFirstLayer(int dir, double zScore)
 {
+   double lot = CalcDynamicLot();
    double price = (dir > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                              : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(!HasEnoughMargin(dir, InpBaseLot, price)) return;
+   if(!HasEnoughMargin(dir, lot, price)) return;
 
-   Print(StringFormat("=== CICLO: %s %.2f @ %.5f Z:%.2f ===",
-         (dir>0)?"BUY":"SELL", InpBaseLot, price, zScore));
+   g_cycleBaseLot = lot;
+   g_dynamicTarget = CalcDynamicTarget(lot);
 
-   bool ok = (dir > 0) ? g_trade.Buy(InpBaseLot, _Symbol, price, 0, 0, "MathEA_L1")
-                        : g_trade.Sell(InpBaseLot, _Symbol, price, 0, 0, "MathEA_L1");
+   Print(StringFormat("=== CICLO: %s %.2f @ %.5f Z:%.2f | Bal:%.0f Target:%.2f ===",
+         (dir>0)?"BUY":"SELL", lot, price, zScore,
+         AccountInfoDouble(ACCOUNT_BALANCE), g_dynamicTarget));
+
+   bool ok = (dir > 0) ? g_trade.Buy(lot, _Symbol, price, 0, 0, "MathEA_L1")
+                        : g_trade.Sell(lot, _Symbol, price, 0, 0, "MathEA_L1");
    if(ok)
    {
       g_cycleActive = true; g_layerCount = 1;
       g_lastLayerPrice = price; g_cycleDir = dir;
-      g_avgEntry = price; g_totalLots = InpBaseLot;
+      g_avgEntry = price; g_totalLots = lot;
       g_barsInTrade = 0;
    }
 }
@@ -261,7 +297,7 @@ bool ShouldAddLayer()
 
 void AddAveragingLayer(double currentPL)
 {
-   double lot = InpBaseLot * MathPow(InpLotReduction, g_layerCount);
+   double lot = g_cycleBaseLot * MathPow(InpLotReduction, g_layerCount);
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    lot = MathFloor(lot / step + 0.5) * step;
@@ -339,6 +375,7 @@ void CloseAll(string reason)
    }
    g_cycleActive = false; g_layerCount = 0;
    g_totalLots = 0; g_avgEntry = 0; g_barsInTrade = 0;
+   g_cycleBaseLot = 0; g_dynamicTarget = 5.0;
 }
 
 void RecoverCycleState()
@@ -360,6 +397,8 @@ void RecoverCycleState()
       if(t > newest) { newest = t; g_lastLayerPrice = px; }
    }
    if(g_totalLots > 0) g_avgEntry = tw / g_totalLots;
+   g_cycleBaseLot = CalcDynamicLot();
+   g_dynamicTarget = CalcDynamicTarget(g_cycleBaseLot);
    double atr = GetATR();
    if(atr > 0) g_zoneSize = NormalizeDouble(atr * InpZoneATRMult, _Digits);
 }
@@ -394,13 +433,13 @@ void UpdateChart(double netPL)
 {
    string st;
    if(g_dailyLoss >= InpDailyLossMax) st = "BLOQUEADO";
-   else if(g_cycleActive) st = StringFormat("ACTIVO L%d/%d P&L:%.2f %db",
-                                             g_layerCount, InpMaxLayers, netPL, g_barsInTrade);
+   else if(g_cycleActive) st = StringFormat("ACTIVO L%d/%d P&L:%.2f T:%.2f %db",
+                                             g_layerCount, InpMaxLayers, netPL, g_dynamicTarget, g_barsInTrade);
    else st = "IDLE";
    string cd = (g_cooldownLeft > 0) ? StringFormat(" CD:%d", g_cooldownLeft) : "";
 
    Comment(StringFormat(
-      "\n  === MATH PATTERN EA v3.1 ===\n"
+      "\n  === MATH PATTERN EA v4.0 ===\n"
       "  %s%s\n"
       "  Z:%.2f (±%.1f) Prev:%.2f\n"
       "  AvgEntry:%.5f Lots:%.3f\n"
