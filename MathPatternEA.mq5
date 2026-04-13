@@ -9,8 +9,8 @@
 // Max exposure ~2.2x base vs 10x+ in v1/v2.
 //+------------------------------------------------------------------+
 #property copyright "Nahuel Scarpelli"
-#property version   "3.10"
-#property description "v3.1: Fix Mean Reversion TP cutting winners too short"
+#property version   "3.20"
+#property description "v3.2: Tighter SL + higher min profit for SMA close"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -34,10 +34,10 @@ input int             InpMaxLayers     = 3;              // Max niveles averagin
 input double          InpZoneATRMult   = 2.0;            // Zona = ATR x esto
 input double          InpLotReduction  = 0.7;            // Cada capa = anterior x esto
 input double          InpTargetProfit  = 5.0;            // Target USD por ciclo
-input double          InpMinProfitForSMA = 2.0;          // Min profit USD para cerrar en SMA
+input double          InpMinProfitForSMA = 3.0;          // Min profit USD para cerrar en SMA (v3.1=2.0)
 
 input group "══════ GESTION DE RIESGO ══════"
-input double          InpHardSL_ATR    = 3.0;            // Hard SL = ATR x esto (v3=4.0)
+input double          InpHardSL_ATR    = 2.5;            // Hard SL = ATR x esto (v3.1=3.0)
 input double          InpMaxDrawdownPct = 20.0;          // Drawdown maximo %
 input double          InpDailyLossMax   = 30.0;          // Perdida diaria max USD
 input int             InpMaxBarsInTrade = 200;           // Time stop (barras)
