@@ -4,29 +4,30 @@
 //|                    EA Matematico: Z-Score + Recuperacion Zonas    |
 //+------------------------------------------------------------------+
 //
-//  LOGICA CENTRAL:
-//  ===============
-//  1. ENTRADA por Z-Score (desviacion estadistica del precio vs media).
-//     No usa indicadores clasicos: pura estadistica.
-//     - Z-Score <= -umbral  →  precio estadisticamente BAJO  →  BUY
-//     - Z-Score >= +umbral  →  precio estadisticamente ALTO  →  SELL
+//  LOGICA CENTRAL v2:
+//  ==================
+//  1. ENTRADA por Z-Score CROSSBACK: no entra cuando el precio es extremo
+//     (puede ser tendencia), sino cuando ERA extremo y ESTA VOLVIENDO.
+//     Confirma que la reversion a la media ya comenzo.
 //
-//  2. RECUPERACION por zonas si la operacion pierde.
-//     No es martingala (no duplica ciegamente). Calcula el lote exacto
-//     para que UN movimiento de zona en la nueva direccion recupere
-//     TODAS las perdidas + el target de ganancia.
+//  2. FILTROS: sesion London+NY, pendiente de SMA (anti-tendencia).
 //
-//  3. CIERRE cuando el P&L neto del basket >= target profit.
+//  3. RECUPERACION por zonas (2 zonas para recuperar, no 1).
+//     Calcula lote exacto para que 2 movimientos de zona en la nueva
+//     direccion recuperen TODAS las perdidas + target.
+//     Menos presion de margen que v1.
 //
-//  4. SEGURIDAD: max capas, max drawdown %, limite diario de perdida.
+//  4. CIERRE cuando el P&L neto del basket >= target profit.
+//
+//  5. SEGURIDAD: max capas, max drawdown %, limite diario, cooldown.
 //
 //  REQUIERE: Cuenta HEDGING (necesita BUY y SELL simultaneos)
 //  TIMEFRAME RECOMENDADO: M15
 //
 //+------------------------------------------------------------------+
 #property copyright "Nahuel Scarpelli"
-#property version   "1.00"
-#property description "EA Matematico: Z-Score + Recuperacion por Zonas"
+#property version   "2.00"
+#property description "EA Matematico v2: Z-Score Crossback + Recuperacion Zonas"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -37,18 +38,25 @@
 input group "══════ MOTOR ESTADISTICO ══════"
 input ENUM_TIMEFRAMES InpTimeframe     = PERIOD_M15;     // Timeframe de analisis
 input int             InpZScorePeriod  = 100;            // Periodo Z-Score (barras)
-input double          InpZScoreEntry   = 2.0;            // Umbral Z-Score para entrada
+input double          InpZScoreEntry   = 2.5;            // Umbral Z-Score para entrada (v1=2.0)
 input int             InpATRPeriod     = 14;             // Periodo ATR
+
+input group "══════ FILTROS ══════"
+input int             InpSessionStart  = 7;              // Hora inicio sesion (servidor)
+input int             InpSessionEnd    = 20;             // Hora fin sesion (servidor)
+input double          InpMaxSMASlope   = 0.0004;         // Pendiente max SMA (filtro tendencia)
+input int             InpCooldownBars  = 10;             // Barras de espera tras ciclo perdedor
 
 input group "══════ SISTEMA DE RECUPERACION ══════"
 input double          InpBaseLot       = 0.01;           // Lote base
-input int             InpMaxLayers     = 6;              // Capas maximas de recuperacion
-input double          InpZoneATRMult   = 1.5;            // Distancia zona = ATR x este valor
-input double          InpTargetProfit  = 3.0;            // Ganancia objetivo por ciclo (USD)
+input int             InpMaxLayers     = 5;              // Capas maximas (v1=6)
+input double          InpZoneATRMult   = 2.0;            // Distancia zona = ATR x este valor (v1=1.5)
+input double          InpTargetProfit  = 5.0;            // Ganancia objetivo por ciclo USD (v1=3.0)
+input int             InpRecoveryZones = 2;              // Zonas para recuperar (v1=1, menos lote)
 
 input group "══════ GESTION DE RIESGO ══════"
 input double          InpMaxDrawdownPct = 30.0;          // Drawdown maximo % del balance
-input double          InpDailyLossMax   = 50.0;          // Perdida diaria maxima (USD)
+input double          InpDailyLossMax   = 30.0;          // Perdida diaria maxima USD (v1=50)
 input int             InpMagicNumber    = 777777;        // Magic Number
 
 //+------------------------------------------------------------------+
@@ -71,6 +79,12 @@ int    g_dailyDate      = 0;
 
 // New bar tracking
 datetime g_lastBarTime  = 0;
+
+// Cooldown after losing cycle
+int    g_cooldownLeft   = 0;
+
+// Previous bar Z-Score (for crossback detection)
+double g_prevZScore     = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                              |
@@ -111,11 +125,13 @@ int OnInit()
    }
 
    Print("===================================================");
-   Print("  Math Pattern EA v1.0 - Inicializado");
+   Print("  Math Pattern EA v2.0 - Inicializado");
    Print(StringFormat("  Timeframe: %s | Z-Score: %d periodos, umbral ±%.1f",
          EnumToString(InpTimeframe), InpZScorePeriod, InpZScoreEntry));
-   Print(StringFormat("  Lote base: %.2f | Max capas: %d | Target: $%.2f",
-         InpBaseLot, InpMaxLayers, InpTargetProfit));
+   Print(StringFormat("  Sesion: %02d:00-%02d:00 | Cooldown: %d barras",
+         InpSessionStart, InpSessionEnd, InpCooldownBars));
+   Print(StringFormat("  Lote base: %.2f | Max capas: %d | Target: $%.2f | RecZones: %d",
+         InpBaseLot, InpMaxLayers, InpTargetProfit, InpRecoveryZones));
    Print(StringFormat("  Drawdown max: %.0f%% | Loss diario max: $%.0f",
          InpMaxDrawdownPct, InpDailyLossMax));
    Print("===================================================");
@@ -157,8 +173,9 @@ void OnTick()
    if(positions > 0 && netPL < -(balance * InpMaxDrawdownPct / 100.0))
    {
       g_dailyLoss += MathAbs(netPL);
-      CloseAllPositions(StringFormat("DRAWDOWN MAXIMO: %.2f USD (%.1f%%)",
-                        netPL, (netPL / balance) * 100.0));
+      g_cooldownLeft = InpCooldownBars;
+      CloseAllPositions(StringFormat("DRAWDOWN MAXIMO: %.2f USD (%.1f%%) - Cooldown %d barras",
+                        netPL, (netPL / balance) * 100.0, InpCooldownBars));
       UpdateChartComment(netPL);
       return;
    }
@@ -195,7 +212,7 @@ void OnTick()
       Print("MathPatternEA: Ciclo terminado (posiciones cerradas externamente)");
    }
 
-   //=== IDLE: Look for Z-Score entry on new bar ===
+   //=== IDLE: Look for Z-Score CROSSBACK entry on new bar ===
    if(!g_cycleActive)
    {
       datetime currentBarTime = iTime(_Symbol, InpTimeframe, 0);
@@ -206,19 +223,53 @@ void OnTick()
       }
       g_lastBarTime = currentBarTime;
 
+      //--- Cooldown check
+      if(g_cooldownLeft > 0)
+      {
+         g_cooldownLeft--;
+         g_prevZScore = CalcZScore();
+         UpdateChartComment(0);
+         return;
+      }
+
+      //--- Session filter
+      if(!IsWithinSession())
+      {
+         g_prevZScore = CalcZScore();
+         UpdateChartComment(0);
+         return;
+      }
+
       double zScore = CalcZScore();
       double atr    = GetATR();
       if(atr <= 0)
       {
+         g_prevZScore = zScore;
+         UpdateChartComment(0);
+         return;
+      }
+
+      //--- Trend filter: skip if SMA slope is too steep
+      if(IsTrending())
+      {
+         g_prevZScore = zScore;
          UpdateChartComment(0);
          return;
       }
 
       g_zoneSize = NormalizeDouble(atr * InpZoneATRMult, _Digits);
 
+      //--- Z-Score CROSSBACK: was extreme, now returning toward zero
       int direction = 0;
-      if(zScore <= -InpZScoreEntry)      direction = +1;   // Oversold  -> BUY
-      else if(zScore >= InpZScoreEntry)  direction = -1;   // Overbought -> SELL
+
+      // BUY: previous bar was below -threshold, current crossed back above it
+      if(g_prevZScore <= -InpZScoreEntry && zScore > -InpZScoreEntry)
+         direction = +1;
+      // SELL: previous bar was above +threshold, current crossed back below it
+      else if(g_prevZScore >= InpZScoreEntry && zScore < InpZScoreEntry)
+         direction = -1;
+
+      g_prevZScore = zScore;
 
       if(direction != 0)
          OpenFirstLayer(direction, zScore);
@@ -334,6 +385,7 @@ void AddRecoveryLayer(double currentNetPL)
             g_layerCount + 1, lot));
       // Force close - can't recover without margin
       g_dailyLoss += MathAbs(currentNetPL);
+      g_cooldownLeft = InpCooldownBars;
       CloseAllPositions("SIN MARGEN PARA RECUPERACION");
       return;
    }
@@ -363,8 +415,9 @@ void AddRecoveryLayer(double currentNetPL)
    }
 }
 
-//--- Calculate exact lot to recover all losses + target in one zone move
-//    Formula: lot = (|totalLoss| + targetProfit) / zoneValuePerLot
+//--- Calculate lot to recover losses + target over InpRecoveryZones zone moves
+//    Formula: lot = (|totalLoss| + targetProfit) / (zoneValuePerLot * recoveryZones)
+//    v2: spreads recovery over multiple zones = smaller lots = less margin pressure
 double CalcRecoveryLot(double totalNetPL)
 {
    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -379,7 +432,8 @@ double CalcRecoveryLot(double totalNetPL)
    if(zoneValuePerLot <= 0)
       return InpBaseLot;
 
-   double needed = (MathAbs(totalNetPL) + InpTargetProfit) / zoneValuePerLot;
+   // Spread recovery over multiple zones (less aggressive lot sizing)
+   double needed = (MathAbs(totalNetPL) + InpTargetProfit) / (zoneValuePerLot * InpRecoveryZones);
 
    // Normalize to broker lot constraints
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -465,6 +519,36 @@ void RecoverCycleState()
 }
 
 //+------------------------------------------------------------------+
+//|                  FILTERS                                           |
+//+------------------------------------------------------------------+
+
+//--- Check if current time is within allowed trading session
+bool IsWithinSession()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int hour = dt.hour;
+
+   if(InpSessionStart < InpSessionEnd)
+      return (hour >= InpSessionStart && hour < InpSessionEnd);
+   else  // Wraps midnight
+      return (hour >= InpSessionStart || hour < InpSessionEnd);
+}
+
+//--- Check if market is trending (SMA slope too steep)
+bool IsTrending()
+{
+   double sma[];
+   ArraySetAsSeries(sma, true);
+   if(CopyBuffer(g_hSMA, 0, 0, 3, sma) < 3)
+      return false;
+
+   // Slope = (SMA[0] - SMA[2]) / 2  (normalized over 2 bars)
+   double slope = MathAbs(sma[0] - sma[2]) / 2.0;
+   return (slope > InpMaxSMASlope);
+}
+
+//+------------------------------------------------------------------+
 //|                  UTILITIES                                         |
 //+------------------------------------------------------------------+
 
@@ -520,20 +604,27 @@ void UpdateChartComment(double netPL)
 
    double zScore = CalcZScore();
 
+   string cooldownStr = (g_cooldownLeft > 0) ? StringFormat(" | Cooldown: %d", g_cooldownLeft) : "";
+   string sessionStr = IsWithinSession() ? "SI" : "NO";
+
    Comment(StringFormat(
       "\n"
       "  ========================================\n"
-      "    MATH PATTERN EA v1.0\n"
+      "    MATH PATTERN EA v2.0\n"
       "  ========================================\n"
-      "    Estado:     %s\n"
+      "    Estado:     %s%s\n"
       "    Z-Score:    %.2f  (umbral: ±%.1f)\n"
-      "    Zona:       %.1f pts\n"
+      "    Prev Z:     %.2f\n"
+      "    Zona:       %.1f pts | RecZones: %d\n"
+      "    Sesion:     %s (%02d-%02d)\n"
       "    Loss diario: %.2f / %.2f USD\n"
       "    Balance:    %.2f USD\n"
       "  ========================================\n",
-      stateStr,
+      stateStr, cooldownStr,
       zScore, InpZScoreEntry,
-      g_zoneSize / _Point,
+      g_prevZScore,
+      g_zoneSize / _Point, InpRecoveryZones,
+      sessionStr, InpSessionStart, InpSessionEnd,
       g_dailyLoss, InpDailyLossMax,
       AccountInfoDouble(ACCOUNT_BALANCE)
    ));
